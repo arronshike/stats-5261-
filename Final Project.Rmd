@@ -1,0 +1,401 @@
+---
+title: "Final Project"
+author: "Ke Shi"
+date: "6/26/2019"
+output: html_document
+---
+
+```{r}
+install.packages('ggplot2')
+install.packages('tseries')
+install.packages("forecast")
+install.packages("PerformanceAnalytics")
+install.packages("quadprog")
+```
+
+# Identify subset
+```{r}
+full <- list.files(path="~/Desktop/full_history",pattern="*.csv")
+n <- length(full)
+Asset1 <- read.csv(paste("~/Desktop/full_history/",full[1],sep=""))
+end <- which(Asset1$date=="2009-04-15")
+begin <- which(Asset1$date=="2019-04-18")
+sum(Asset1$volume<1000)/nrow(Asset1) <= 0.05 #check the volume of the first asset
+price1 <- Asset1[begin:end,c("date","adjclose")]
+df <- price1[order(price1$date),]
+colnames(df) <- c("date",substr(full[1],1,nchar(full[1])-4))
+base <- df
+for (i in 2:n) {
+  asset <- read.csv(paste("~/Desktop/full_history/",full[i],sep=""))
+  if (nrow(asset)>=2521 & all(base$date %in% asset$date)) {
+    end_time <- which(asset$date=="2009-04-15")
+    begin_time <- which(asset$date=="2019-04-18")
+    assetprice <- asset[begin:end,]
+    if (sum(assetprice$volume<1000)/2521 <= 0.05 & sum(is.na(asset$adjclose))/2521 <= 0.05) {
+      colnames(assetprice)[7] <- substr(full[i],1,nchar(full[i])-4)
+      price <- assetprice[order(assetprice$date),c(1,7)] #change order of the time
+      df <- merge(df,price)
+    }
+  }
+}
+dim(df) #2521*3199
+```
+
+#compute log return
+```{r}
+log_return <- function(x) {
+  diff(log(x))
+}
+logreturn <- apply(df[,-1],2,log_return)
+```
+
+# detect and replace missing values and outliers
+```{r}
+library(forecast)
+fullprice <- cbind(df[-1,1],logreturn)
+#remove assets with more than 5% missing values
+a <- 2
+for (i in 1:ncol(logreturn)) {
+  if (sum(is.na(logreturn[,i]))/2520 <= 0.05) {
+    fullprice[,a]==logreturn[,i]
+    a <- a+1
+  }
+} #there are 3198 left 
+#table(is.na(fullprice))
+missing <- function(x) {
+  na.interp(x)
+}
+finalprice <- apply(fullprice[,-1],2,missing)
+#table(is.na(finalprice))
+price_clean <- apply(finalprice,2,tsclean)
+rownames(price_clean) <- df[-1,1] #define date as rownmaes
+cormat <- cor(price_clean) #correlation matrix
+```
+
+# asset selection & portfolio optimization
+```{r}
+#sp500
+SP500 <- read.csv("~/Downloads/SP500new.csv",header=TRUE)
+begin <- which(SP500$Date=="2009-04-15")
+end <- which(SP500$Date=="2019-04-18")
+SP500new <- SP500[begin:end,"Close"]
+SP500_return <- log_return(SP500new)
+
+#forecast over h days
+pred.arima<-function(x){
+  fit<-auto.arima(x,seasonal = F,allowmean = T)
+  return(sum(forecast(fit,5)$mean))
+}
+#use for omega in BL model
+covresi<-function(x){
+  fit1<-auto.arima(x,seasonal = F,allowmean = T)
+  return(residuals(fit1))
+}
+#Black Litterman Model
+BL <- function(x) {
+  tscalar <- 1
+  mean_vect <- apply(x, 2, mean)
+  q <- (1/5)*apply(x,2,pred.arima) #return over h days and transfer it into daily
+  resi <- apply(x,2,covresi)
+  omega <- cov(resi)
+  covmat <- as.matrix(cov(x))
+  var1 <- solve(tscalar * covmat)
+  muBL <- solve(var1+solve(omega)) %*% (var1 %*% mean_vect + solve(omega) %*% q)
+  covBL <- solve(var1 + solve(omega))
+  Amat <- cbind(rep(1, 30), diag(1, nrow = 30))
+  bvec <- c(1, rep(0,30))
+  result <- solve.QP(Dmat = 2*covBL, dvec = rep(0,30), Amat = Amat, bvec = bvec, meq = 1)
+  return(result$solution)
+}
+#start of rolling window
+m <- 252
+h <- 5
+#h <- 20
+numofrolling <- floor((nrow(price_clean)-m)/h)
+summary <- matrix(data=NA,nrow=ncol(price_clean),ncol=4)
+colnames(summary) <- c("mean return","volatility","sharpe ratio","beta")
+rownames(summary) <- colnames(price_clean)
+first_asset_name <- list()
+asset_name <- list()
+weights <- list()
+equal_return <- c()
+opt_return <- c()
+sp_return <- c()
+alloptweights <- matrix(data=0,nrow=3198,ncol=numofrolling) #for turnover later 
+rownames(alloptweights) <- colnames(price_clean)
+allequalweights <- matrix(data=0,nrow=3198,ncol=numofrolling) #for turnover later 
+rownames(allequalweights) <- colnames(price_clean)
+library(quadprog)
+for (i in 1:numofrolling) {
+  start <- h*i-(h-1)
+  sub_in <- price_clean[start:(start+(m-1)),]
+  sub_out <- price_clean[(start+252):(start+252+(h-1)),]
+  mu <- 252*colMeans(sub_in)
+  sig <- sqrt(252)*apply(sub_in, 2, sd)
+  sharpe <- mu/sig
+  model <- lm(sub_in ~ SP500_return[start:(start+(m-1))])
+  beta <- coef(model)[2,]
+  summary[,1] <- mu
+  summary[,2] <- sig
+  summary[,3] <- sharpe
+  summary[,4] <- beta
+  select <- summary[order(summary[,3],decreasing=TRUE),] 
+  first_asset_name[[i]] <- rownames(select)[1:40] #top 40 sharp ratio 
+  sample <- sub_in[,first_asset_name[[i]]] #set of selectd assets using only in_sample
+  corr_order <- order(abs(cor(sample)[1,]),decreasing=FALSE)
+  in_sample <- cbind(sample[,1],sample[,corr_order[1:29]])
+  colnames(in_sample) <- c(first_asset_name[[i]][1],colnames(sample[,corr_order[1:29]]))
+  asset_name[[i]] <- colnames(in_sample)
+  out_sample <- sub_out[,asset_name[[i]]]
+  weights[[i]] <- BL(in_sample)
+  #equal weights return
+  equal <- c(rep(1/30,30))
+  allequalweights[c(asset_name[[i]]),i] <- equal
+  ewp <- out_sample %*% equal
+  equal_return[i] <- sum(ewp)
+  #optimal weights return
+  alloptweights[c(asset_name[[i]]),i] <- weights[[i]] 
+  opt <- out_sample %*% weights[[i]]
+  opt_return[i] <- sum(opt)
+  #sp500 return
+  sp_return[i] <- sum(SP500_return[(start+252):(start+252+(h-1))])
+}
+```
+
+#cumulative return 
+```{r}
+plot(cumsum(opt_return),type='l',col=2, xlab="Window",ylab="Cumulative Return",ylim=c(-0.2,1))
+lines(cumsum(equal_return),type='l',col=3)
+lines(cumsum(sp_return),type='l',col=4)
+legend("bottomright",c("optiomal weight","equally weight","SP500"),
+       col=c(2:4),pch=1)
+```
+
+#Overall Summary 
+```{r}
+library(PerformanceAnalytics)
+overall_summary <- matrix(data=NA,nrow=3,ncol=6)
+colnames(overall_summary) <- c("mean return","volatility","sharpe ratio","sortino ratio","maximum drawdown","turnover")
+rownames(overall_summary) <- c("optimal portfolio","equally portfolio","SP500")
+#mean return annualized
+sp_mean <- (252/h)*mean(sp_return)
+ew_mean <- (252/h)*mean(equal_return)
+opt_mean <- (252/h)*mean(opt_return)
+#volatility annualized
+sp_sd <- sqrt(252/h)*sd(sp_return)
+ew_sd <- sqrt(252/h)*sd(equal_return)
+opt_sd <- sqrt(252/h)*sd(opt_return)
+#sharpe ratio annualized
+sp_sharpe <- sp_mean/sp_sd
+ew_sharpe <- ew_mean/ew_sd
+opt_sharpe <- opt_mean/opt_sd
+#sortino ratio annualized
+sp_sortino <- sqrt(252/h)*SortinoRatio(sp_return)
+ew_sortino <- sqrt(252/h)*SortinoRatio(equal_return)
+opt_sortino <- sqrt(252/h)*SortinoRatio(opt_return)
+#maximum drawdown 
+sp_md <- maxDrawdown(sp_return)
+ew_md <- maxDrawdown(equal_return)
+opt_md <- maxDrawdown(opt_return)
+#turnover
+sp_turn <- 0
+opt_turn <- c()
+ew_turn <- c()
+for (i in 1:(numofrolling-1)) {
+  opt_turn[i] <- sum(abs(alloptweights[,i+1]-alloptweights[,i]))
+  ew_turn[i] <- sum(abs(allequalweights[,i+1]-allequalweights[,i]))
+}
+#final table
+overall_summary[,1] <- c(opt_mean,ew_mean,sp_mean)
+overall_summary[,2] <- c(opt_sd,ew_sd,sp_sd)
+overall_summary[,3] <- c(opt_sharpe,ew_sharpe,sp_sharpe)
+overall_summary[,4] <- c(opt_sortino,ew_sortino,sp_sortino)
+overall_summary[,5] <- c(opt_md,ew_md,sp_md)
+overall_summary[,6] <- c(mean(opt_turn),mean(ew_turn),sp_turn)
+overall_summary
+```
+
+#net return
+```{r}
+k <- 0.0005
+net_return <- c()
+for (i in 1:numofrolling-1) {
+  gross_return <- opt_return[i]
+  net_return[i] <- (1-k*opt_turn[i])*(1+gross_return)-1
+}
+plot(cumsum(net_return),type='l',col=1, xlab="Window",ylab="Cumulative Return",ylim=c(0,1))
+lines(cumsum(opt_return),type='l',col=2)
+lines(cumsum(equal_return),type='l',col=3)
+lines(cumsum(sp_return),type='l',col=4)
+legend("bottomright",c("net return","optiomal weighted","equally weighte","SP500"),
+       col=c(1:4),pch=1)
+library(PerformanceAnalytics)
+stats <- matrix(data=NA,nrow=1,ncol=5)
+colnames(stats) <- c("mean return","volatility","sharpe ratio","sortino ratio","maximum drawdown")
+stats[,1] <- (252/h)*mean(net_return)
+stats[,2] <- sqrt(252/h)*sd(net_return)
+stats[,3] <- stats[,1]/stats[,2]
+stats[,4] <- sqrt(252/h)*SortinoRatio(net_return)
+stats[,5] <- maxDrawdown(net_return)
+stats
+```
+
+# repeat again for h=20
+```{r}
+#forecast over h days
+pred.arima<-function(x){
+  fit<-auto.arima(x,seasonal = F,allowmean = T)
+  return(sum(forecast(fit,20)$mean))
+}
+#use for omega in BL model
+covresi<-function(x){
+  fit1<-auto.arima(x,seasonal = F,allowmean = T)
+  return(residuals(fit1))
+}
+#Black Litterman Model
+BL <- function(x) {
+  tscalar <- 1
+  mean_vect <- apply(x, 2, mean)
+  q <- (1/5)*apply(x,2,pred.arima) #return over h days and transfer it into daily
+  resi <- apply(x,2,covresi)
+  omega <- cov(resi)
+  covmat <- as.matrix(cov(x))
+  var1 <- solve(tscalar * covmat)
+  muBL <- solve(var1+solve(omega)) %*% (var1 %*% mean_vect + solve(omega) %*% q)
+  covBL <- solve(var1 + solve(omega))
+  Amat <- cbind(rep(1, 30), diag(1, nrow = 30))
+  bvec <- c(1, rep(0,30))
+  result <- solve.QP(Dmat = 2*covBL, dvec = rep(0,30), Amat = Amat, bvec = bvec, meq = 1)
+  return(result$solution)
+}
+#start of rolling window
+m <- 252
+h <- 20
+numofrolling <- floor((nrow(price_clean)-m)/h)
+summary <- matrix(data=NA,nrow=ncol(price_clean),ncol=4)
+colnames(summary) <- c("mean return","volatility","sharpe ratio","beta")
+rownames(summary) <- colnames(price_clean)
+first_asset_name <- list()
+asset_name <- list()
+weights <- list()
+equal_return <- c()
+opt_return <- c()
+sp_return <- c()
+alloptweights <- matrix(data=0,nrow=3198,ncol=numofrolling) #for turnover later 
+rownames(alloptweights) <- colnames(price_clean)
+allequalweights <- matrix(data=0,nrow=3198,ncol=numofrolling) #for turnover later 
+rownames(allequalweights) <- colnames(price_clean)
+library(quadprog)
+for (i in 1:numofrolling) {
+  start <- h*i-(h-1)
+  sub_in <- price_clean[start:(start+(m-1)),]
+  sub_out <- price_clean[(start+252):(start+252+(h-1)),]
+  mu <- 252*colMeans(sub_in)
+  sig <- sqrt(252)*apply(sub_in, 2, sd)
+  sharpe <- mu/sig
+  model <- lm(sub_in ~ SP500_return[start:(start+(m-1))])
+  beta <- coef(model)[2,]
+  summary[,1] <- mu
+  summary[,2] <- sig
+  summary[,3] <- sharpe
+  summary[,4] <- beta
+  #box.pvalue<-apply(sub_in, 2, fun <- function(x) {Box.test(x,type="Ljung-Box")$p.value})
+  #summary <- cbind(summary,box.pvalue)
+  select <- summary[order(summary[,3],decreasing=TRUE),] 
+  first_asset_name[[i]] <- rownames(select)[1:40] #top 40 sharpe ratio
+  sample <- sub_in[,first_asset_name[[i]]] #set of selectd assets using only in_sample
+  corr_order <- order(abs(cor(sample)[1,]),decreasing=FALSE)
+  in_sample <- cbind(sample[,1],sample[,corr_order[1:29]])
+  colnames(in_sample) <- c(first_asset_name[[i]][1],colnames(sample[,corr_order[1:29]]))
+  asset_name[[i]] <- colnames(in_sample)
+  out_sample <- sub_out[,asset_name[[i]]]
+  weights[[i]] <- BL(in_sample)
+  #equal weights return
+  equal <- c(rep(1/30,30))
+  allequalweights[c(asset_name[[i]]),i] <- equal
+  ewp <- out_sample %*% equal
+  equal_return[i] <- sum(ewp)
+  #optimal weights return
+  alloptweights[c(asset_name[[i]]),i] <- weights[[i]] 
+  opt <- out_sample %*% weights[[i]]
+  opt_return[i] <- sum(opt)
+  #sp500 return
+  sp_return[i] <- sum(SP500_return[(start+252):(start+252+(h-1))])
+}
+
+
+#cumulative return 
+plot(cumsum(opt_return),type='l',col=2, xlab="Window",ylab="Cumulative Return",ylim=c(-0.2,1))
+lines(cumsum(equal_return),type='l',col=3)
+lines(cumsum(sp_return),type='l',col=4)
+legend("bottomright",c("optiomal weight","equally weight","SP500"),
+       col=c(2:4),pch=1)
+
+library(PerformanceAnalytics)
+overall_summary <- matrix(data=NA,nrow=3,ncol=6)
+colnames(overall_summary) <- c("mean return","volatility","sharpe ratio","sortino ratio","maximum drawdown","turnover")
+rownames(overall_summary) <- c("optimal portfolio","equally portfolio","SP500")
+#mean return annualized
+sp_mean <- (252/h)*mean(sp_return)
+ew_mean <- (252/h)*mean(equal_return)
+opt_mean <- (252/h)*mean(opt_return)
+#volatility annualized
+sp_sd <- sqrt(252/h)*sd(sp_return)
+ew_sd <- sqrt(252/h)*sd(equal_return)
+opt_sd <- sqrt(252/h)*sd(opt_return)
+#sharpe ratio annualized
+sp_sharpe <- sp_mean/sp_sd
+ew_sharpe <- ew_mean/ew_sd
+opt_sharpe <- opt_mean/opt_sd
+#sortino ratio annualized
+sp_sortino <- sqrt(252/h)*SortinoRatio(sp_return)
+ew_sortino <- sqrt(252/h)*SortinoRatio(equal_return)
+opt_sortino <- sqrt(252/h)*SortinoRatio(opt_return)
+#maximum drawdown 
+sp_md <- maxDrawdown(sp_return)
+ew_md <- maxDrawdown(equal_return)
+opt_md <- maxDrawdown(opt_return)
+#turnover
+sp_turn <- 0
+opt_turn <- c()
+ew_turn <- c()
+for (i in 1:(numofrolling-1)) {
+  opt_turn[i] <- sum(abs(alloptweights[,i+1]-alloptweights[,i]))
+  ew_turn[i] <- sum(abs(allequalweights[,i+1]-allequalweights[,i]))
+}
+#final table
+overall_summary[,1] <- c(opt_mean,ew_mean,sp_mean)
+overall_summary[,2] <- c(opt_sd,ew_sd,sp_sd)
+overall_summary[,3] <- c(opt_sharpe,ew_sharpe,sp_sharpe)
+overall_summary[,4] <- c(opt_sortino,ew_sortino,sp_sortino)
+overall_summary[,5] <- c(opt_md,ew_md,sp_md)
+overall_summary[,6] <- c(mean(opt_turn),mean(ew_turn),sp_turn)
+overall_summary
+
+#net return
+k <- 0.0005
+net_return <- c()
+for (i in 1:numofrolling-1) {
+  gross_return <- opt_return[i]
+  net_return[i] <- (1-k*opt_turn[i])*(1+gross_return)-1
+}
+plot(cumsum(net_return),type='l',col=1, xlab="Window",ylab="net return Cumulative Return",ylim=c(0,1))
+lines(cumsum(opt_return),type='l',col=2)
+lines(cumsum(equal_return),type='l',col=3)
+lines(cumsum(sp_return),type='l',col=4)
+legend("bottomright",c("net return","optiomal weighted","equally weighte","SP500"),
+       col=c(1:4),pch=1)
+library(PerformanceAnalytics)
+stats <- matrix(data=NA,nrow=1,ncol=5)
+colnames(stats) <- c("mean return","volatility","sharpe ratio","sortino ratio","maximum drawdown")
+stats[,1] <- (252/h)*mean(net_return)
+stats[,2] <- sqrt(252/h)*sd(net_return)
+stats[,3] <- stats[,1]/stats[,2]
+stats[,4] <- sqrt(252/h)*SortinoRatio(net_return)
+stats[,5] <- maxDrawdown(net_return)
+stats
+```
+
+
+
+
